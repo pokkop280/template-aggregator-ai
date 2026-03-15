@@ -1,0 +1,201 @@
+name: iOS Build with EAS
+
+# Триггеры запуска workflow
+on:
+  # Ручной запуск через UI GitHub
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'EAS Build Profile'
+        required: true
+        default: 'preview'
+        type: choice
+        options:
+          - development
+          - preview
+          - production
+      platform:
+        description: 'Platform'
+        required: true
+        default: 'ios'
+        type: choice
+        options:
+          - ios
+          - all
+
+  # Автоматический запуск при push в main
+  push:
+    branches:
+      - main
+    paths:
+      - 'app/**'
+      - 'components/**'
+      - 'services/**'
+      - 'constants/**'
+      - 'app.json'
+      - 'eas.json'
+      - 'package.json'
+
+jobs:
+  build:
+    name: EAS Build for iOS
+    runs-on: ubuntu-latest
+
+    steps:
+      # Шаг 1: Checkout репозитория
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Шаг 2: Настройка Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+          cache-dependency-path: './package-lock.json'
+
+      # Шаг 3: Установка зависимостей
+      - name: Install dependencies
+        run: npm ci
+
+      # Шаг 4: Настройка Expo и EAS CLI
+      - name: Setup Expo and EAS CLI
+        uses: expo/expo-github-action@v8
+        with:
+          expo-version: latest
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      # Шаг 5: Проверка конфигурации EAS
+      - name: Verify EAS configuration
+        run: |
+          echo "Project ID from app.json:"
+          npx eas-cli project:info
+          echo "Available build profiles:"
+          cat eas.json
+
+      # Шаг 6: Определение профиля сборки
+      - name: Determine build profile
+        id: build-profile
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "profile=${{ github.event.inputs.profile }}" >> $GITHUB_OUTPUT
+            echo "platform=${{ github.event.inputs.platform }}" >> $GITHUB_OUTPUT
+          else
+            echo "profile=preview" >> $GITHUB_OUTPUT
+            echo "platform=ios" >> $GITHUB_OUTPUT
+          fi
+
+      # Шаг 7: Запуск EAS Build для iOS
+      - name: Build iOS with EAS
+        id: eas-build
+        run: |
+          echo "Starting EAS build with profile: ${{ steps.build-profile.outputs.profile }}"
+
+          # Запуск сборки и сохранение build ID
+          BUILD_OUTPUT=$(npx eas-cli build \
+            --platform ${{ steps.build-profile.outputs.platform }} \
+            --profile ${{ steps.build-profile.outputs.profile }} \
+            --non-interactive \
+            --no-wait \
+            --json)
+
+          echo "Build output:"
+          echo "$BUILD_OUTPUT"
+
+          # Извлечение Build ID для iOS
+          BUILD_ID=$(echo "$BUILD_OUTPUT" | jq -r '.[] | select(.platform=="ios") | .id')
+          echo "iOS Build ID: $BUILD_ID"
+          echo "build_id=$BUILD_ID" >> $GITHUB_OUTPUT
+
+          # Ожидание завершения сборки (таймаут 45 минут)
+          echo "Waiting for build to complete..."
+          npx eas-cli build:wait $BUILD_ID --timeout 45
+
+      # Шаг 8: Получение информации о сборке
+      - name: Get build details
+        id: build-details
+        run: |
+          BUILD_INFO=$(npx eas-cli build:view ${{ steps.eas-build.outputs.build_id }} --json)
+          echo "Build info:"
+          echo "$BUILD_INFO" | jq '.'
+
+          # Извлечение URL артефакта
+          ARTIFACT_URL=$(echo "$BUILD_INFO" | jq -r '.artifacts.buildUrl // .artifacts.applicationArchiveUrl // empty')
+          echo "Artifact URL: $ARTIFACT_URL"
+          echo "artifact_url=$ARTIFACT_URL" >> $GITHUB_OUTPUT
+
+          # Извлечение статуса сборки
+          BUILD_STATUS=$(echo "$BUILD_INFO" | jq -r '.status')
+          echo "build_status=$BUILD_STATUS" >> $GITHUB_OUTPUT
+
+      # Шаг 9: Проверка успешности сборки
+      - name: Check build status
+        run: |
+          if [ "${{ steps.build-details.outputs.build_status }}" != "finished" ]; then
+            echo "Build failed with status: ${{ steps.build-details.outputs.build_status }}"
+            exit 1
+          fi
+          echo "Build completed successfully!"
+
+      # Шаг 10: Скачивание .ipa файла
+      - name: Download IPA artifact
+        run: |
+          ARTIFACT_URL="${{ steps.build-details.outputs.artifact_url }}"
+
+          if [ -z "$ARTIFACT_URL" ] || [ "$ARTIFACT_URL" = "null" ]; then
+            echo "Error: Artifact URL is empty or null"
+            exit 1
+          fi
+
+          echo "Downloading IPA from: $ARTIFACT_URL"
+
+          # Скачивание файла
+          curl -L -o RoboAI.ipa "$ARTIFACT_URL"
+
+          # Проверка размера файла
+          FILE_SIZE=$(stat -c%s "RoboAI.ipa" 2>/dev/null || stat -f%z "RoboAI.ipa" 2>/dev/null || echo "0")
+          echo "Downloaded file size: $FILE_SIZE bytes"
+
+          if [ "$FILE_SIZE" -lt 1000000 ]; then
+            echo "Warning: File size is suspiciously small (< 1MB)"
+          fi
+
+      # Шаг 11: Сохранение .ipa как GitHub Artifact
+      - name: Upload IPA to GitHub Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: RoboAI-ios-${{ steps.build-profile.outputs.profile }}-${{ github.run_number }}
+          path: RoboAI.ipa
+          retention-days: 30
+          if-no-files-found: error
+
+      # Шаг 12: Создание комментария с результатами
+      - name: Create build summary
+        run: |
+          echo "## iOS Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Profile**: ${{ steps.build-profile.outputs.profile }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Platform**: iOS" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build ID**: ${{ steps.eas-build.outputs.build_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ steps.build-details.outputs.build_status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Artifact**: Available in GitHub Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Download" >> $GITHUB_STEP_SUMMARY
+          echo "Download the .ipa file from GitHub Artifacts: RoboAI-ios-${{ steps.build-profile.outputs.profile }}-${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+
+  # Job для нотификации об ошибках
+  notify-failure:
+    name: Notify on Failure
+    runs-on: ubuntu-latest
+    needs: build
+    if: failure()
+
+    steps:
+      - name: Build failed notification
+        run: |
+          echo "## Build Failed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "The iOS build process failed. Please check the logs above for details." >> $GITHUB_STEP_SUMMARY
